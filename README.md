@@ -10,10 +10,10 @@ A custom System-on-Chip (SoC) implemented in Verilog, integrating a **PicoRV32 R
 ┌───────────────────────────────────────────────────┐
 │                    soc_top                        │
 │                                                   │
-│  ┌─────────────┐     ┌───────────────────────┐   │
-│  │  PicoRV32   │     │    axi_interface       │   │
-│  │  RISC-V CPU │────▶│  (AXI4-Lite Slave FSM)│   │
-│  │  (Master)   │     └──────────┬────────────┘   │
+│  ┌─────────────┐      ┌───────────────────────┐   │
+│  │  PicoRV32   │      │    axi_interface      │   │
+│  │  RISC-V CPU │────▶  (AXI4-Lite Slave FSM)      
+│  │  (Master)   │      └──────────┬────────────┘   │
 │  └─────────────┘                │                 │
 │                                 ▼                 │
 │                       ┌─────────────────┐         │
