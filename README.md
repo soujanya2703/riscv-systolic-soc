@@ -1,30 +1,30 @@
 # RISC-V SoC with Systolic Array ML Accelerator
 
-A custom System-on-Chip (SoC) implemented in Verilog, integrating a **PicoRV32 RISC-V CPU** with a **weight-stationary systolic array** for hardware-accelerated matrix multiplication. The CPU communicates with the accelerator over an AXI4-Lite bus.
+A custom System-on-Chip (SoC) implemented in Verilog, integrating a **PicoRV32 RISC-V CPU** with a **weight-stationary systolic array** for hardware-accelerated matrix multiplication. The CPU communicates with the accelerator over a memory-mapped AXI4-Lite bus.
+
+**Status:** Functionally verified end-to-end via RTL simulation (Icarus Verilog + Vivado XSim). Synthesis/implementation and physical hardware bring-up pending FPGA board access.
 
 ---
 
 ## Architecture Overview
 
+**soc_top** wires together four blocks on a single shared memory bus, arbitrated by address:
+
+- **PicoRV32 (RISC-V CPU, bus master)** — fetches instructions and issues reads/writes
+- **Program/Data Memory (BRAM)** — `0x0000_0000`, holds firmware instructions + data
+- **AXI4-Lite Interface → Systolic Array** — `0x8000_00xx`, CPU writes program the accelerator (control / weights / activations); the array computes weight-stationary MACs
+- **LED/GPIO register** — `0x8000_0010`, write-only output for observability
+- **Result readback** — `0x8000_00x0`, CPU reads back accumulated PE outputs
+
 ```
-┌───────────────────────────────────────────────────┐
-│                    soc_top                        │
-│                                                   │
-│  ┌─────────────┐      ┌───────────────────────┐   │
-│  │  PicoRV32   │      │    axi_interface      │   │
-│  │  RISC-V CPU │────▶  (AXI4-Lite Slave FSM)      
-│  │  (Master)   │      └──────────┬────────────┘   │
-│  └─────────────┘                │                 │
-│                                 ▼                 │
-│                       ┌─────────────────┐         │
-│                       │  systolic_array │         │
-│                       │   (NxN grid of  │         │
-│                       │      PEs)       │         │
-│                       └─────────────────┘         │
-└───────────────────────────────────────────────────┘
+CPU ──┬──▶ Program/Data Memory   (0x0000_0000)
+      ├──▶ AXI4-Lite ──▶ Systolic Array   (0x8000_0000–0008)
+      ├──▶ LED / GPIO register            (0x8000_0010)
+      └──◀ Result readback                (0x8000_0020–002C)
 ```
 
-The CPU issues memory-mapped writes to program the accelerator. The AXI interface decodes these transactions and drives the systolic array with weights and activations.
+
+The CPU boots by fetching real instructions out of on-chip program memory, issues memory-mapped writes to program the accelerator, and reads back the computed result — closing the loop entirely in hardware/firmware, not just testbench stimulus.
 
 ---
 
@@ -32,12 +32,30 @@ The CPU issues memory-mapped writes to program the accelerator. The AXI interfac
 
 | File | Description |
 |---|---|
-| `soc_top.v` | Top-level SoC module; instantiates and wires all components |
+| `soc_top.v` | Top-level SoC module; memory, CPU, and accelerator address decode |
+| `mem.v` | Synthesizable program/data memory (BRAM), loaded via `$readmemh` from `firmware.hex` |
 | `picorv32.v` | PicoRV32 RISC-V CPU core (open-source, third-party) |
 | `axi_interface.v` | AXI4-Lite slave interface with address-decode FSM |
 | `systolic_array.v` | Parameterized NxN systolic array, generated via `genvar` |
 | `pe.v` | Single Processing Element (PE) — multiply-accumulate unit |
-| `full_soc_sim.vvp` | Compiled simulation binary (Icarus Verilog) |
+| `firmware/firmware.S` | RV32IM assembly firmware driving the accelerator from software |
+| `firmware/link.ld` | Linker script placing firmware at address 0x0 |
+| `sim/firmware.hex` | Assembled firmware image, one 32-bit word per line, for `$readmemh` |
+| `sim/tb_soc.sv` | Full-SoC testbench (CPU + memory + AXI + accelerator, end to end) |
+| `sim/tb_systolic.sv` | Earlier testbench exercising only the AXI interface + accelerator in isolation |
+
+---
+
+## Address Map
+
+| Address | Register | Description |
+|---|---|---|
+| `0x0000_0000 – 0x0000_0FFF` | Program/Data RAM | 4KB instruction + data memory |
+| `0x8000_0000` | Control | Bit 0 = `load_weight` |
+| `0x8000_0004` | Weights | Packed weight data for the left column |
+| `0x8000_0008` | Activations | Packed activation data for the top row |
+| `0x8000_0010` | LED / GPIO | Output register, low byte drives board LEDs |
+| `0x8000_0020 / 24 / 28 / 2C` | Result readback | 16-bit accumulated output per PE, one address each |
 
 ---
 
@@ -45,25 +63,33 @@ The CPU issues memory-mapped writes to program the accelerator. The AXI interfac
 
 ### Processing Element (`pe.v`)
 Each PE implements a **weight-stationary** dataflow:
-1. **Load phase** (`load_weight = 1`): The PE latches its `weight_in` into a local register and freezes it.
-2. **Compute phase** (`load_weight = 0`): On every clock cycle, the PE multiplies the incoming activation by its stationary weight and accumulates the result. Data is also propagated to the right (weights) and downward (activations) for the next PE in the grid.
+1. **Load phase** (`load_weight = 1`): The PE latches `weight_in` into a local register and freezes it.
+2. **Compute phase** (`load_weight = 0`): Every clock cycle, the PE multiplies the incoming activation by its stationary weight and accumulates the result, propagating data to the right (weights) and downward (activations) for the next PE in the grid.
 
 The accumulator is double-width (`2 * DATA_WIDTH`) to prevent overflow.
 
+**Known limitation:** the accumulator has no single-shot/stop mode — as long as `load_weight` is low and the activation input is held steady, it keeps accumulating every cycle. This means the result read back depends on exactly how many cycles elapsed between the activation write and the read, rather than a deterministic single MAC result. Worth addressing (e.g. a `start`/`done` pulse) before treating this as a finished accelerator design.
+
 ### Systolic Array (`systolic_array.v`)
-A `GRID_SIZE × GRID_SIZE` grid of PEs is generated using nested `genvar` loops. Flat 1D input buses are unpacked into the 2D wire mesh at the boundaries, and outputs are re-packed into a flat bus. The default configuration is a **2×2 array** with **8-bit data**, producing **16-bit** accumulated outputs.
+A `GRID_SIZE × GRID_SIZE` grid of PEs generated via nested `genvar` loops. Default configuration: **2×2 array**, **8-bit data**, **16-bit** accumulated outputs.
 
 ### AXI4-Lite Interface (`axi_interface.v`)
-A 3-state FSM (`IDLE → WRITE → RESP`) handles the AXI4-Lite write protocol. The CPU programs the accelerator via three memory-mapped registers:
-
-| Address | Register | Description |
-|---|---|---|
-| `0x0000_0000` | Control | Bit 0 = `load_weight` signal |
-| `0x0000_0004` | Weights | Packed weight data for the left column |
-| `0x0000_0008` | Activations | Packed activation data for the top row |
+A 3-state FSM (`IDLE → WRITE → RESP`) handles AXI4-Lite writes. Internally decodes local offsets `0x0/0x4/0x8`; `soc_top.v` translates the CPU's peripheral-space addresses (`0x8000_00xx`) down to these offsets before handing them to this module.
 
 ### SoC Top (`soc_top.v`)
-Connects the PicoRV32 memory bus directly to the AXI slave interface. The CPU's `mem_valid` + `mem_wstrb` signals are decoded to drive the AXI write channels. The PicoRV32 is configured with the **MUL extension enabled** and **DIV disabled**.
+Instantiates program memory, the PicoRV32 core, the AXI-mapped accelerator, and an LED/result-readback register, all arbitrated by address decode on the CPU's single memory bus. PicoRV32 is configured with **MUL enabled**, **DIV disabled**.
+
+---
+
+## Verified Result
+
+Firmware (`firmware/firmware.S`) runs on the CPU and performs the same sequence as the original standalone accelerator test — load weight `0x0402`, freeze it, stream activation `0x0306`, wait for the pipeline, read back PE[0][0]'s result, and write it to the LED register.
+
+Confirmed matching across two independent simulators:
+--- FULL SoC SIMULATION RESULT ---
+LED register value : 160 (0xa0)
+
+(Icarus Verilog and Vivado XSim behavioral simulation, same firmware image, same result.)
 
 ---
 
@@ -74,38 +100,48 @@ Connects the PicoRV32 memory bus directly to the AXI slave interface. The CPU's 
 | `GRID_SIZE` | `2` | Width/height of the systolic array (NxN) |
 | `DATA_WIDTH` | `8` | Bit-width of weights and activations |
 
-To scale up to a 4×4 array, change `GRID_SIZE` to `4` in the `soc_top.v` instantiation.
+To scale up to a 4×4 array, change `GRID_SIZE` to `4` in the `soc_top.v` instantiations of `axi_interface` and `systolic_array` (note: the LED/AXI data-path widths are currently sized for `GRID_SIZE=2` and would need widening too).
 
 ---
 
 ## Running the Simulation
 
-The repo includes a pre-compiled simulation binary. Run it directly with:
-
+**Icarus Verilog:**
 ```bash
+cd sim
+iverilog -g2012 -o full_soc_sim.vvp ../rtl/soc_top.v ../rtl/picorv32.v \
+    ../rtl/mem.v ../rtl/axi_interface.v ../rtl/systolic_array.v ../rtl/pe.v tb_soc.sv
 vvp full_soc_sim.vvp
 ```
 
-To recompile from source (requires [Icarus Verilog](https://steveicarus.github.io/iverilog/)):
+**Vivado (behavioral simulation):**
+Add all `rtl/*.v` files as Design Sources, `sim/tb_soc.sv` as a Simulation Source (set as top), and `sim/firmware.hex` as a Design Source (needed by both synthesis and simulation via `mem.v`'s `$readmemh`). Run **Flow Navigator → Run Simulation → Run Behavioral Simulation**, then `run all` in the Tcl console.
 
+To view waveforms in Icarus output: `gtkwave dump_soc.vcd`
+
+### Rebuilding the firmware image
 ```bash
-iverilog -o full_soc_sim.vvp soc_top.v picorv32.v axi_interface.v systolic_array.v pe.v <your_testbench>.v
-vvp full_soc_sim.vvp
+riscv64-linux-gnu-as -march=rv32im -mabi=ilp32 -o firmware.o firmware/firmware.S
+riscv64-linux-gnu-ld -m elf32lriscv -T firmware/link.ld -o firmware.elf firmware.o
+riscv64-linux-gnu-objcopy -O binary firmware.elf firmware.bin
 ```
-
-To view waveforms, add `$dumpfile`/`$dumpvars` to your testbench and open the output with [GTKWave](http://gtkwave.sourceforge.net/):
-
-```bash
-gtkwave dump.vcd
-```
+Then convert the raw binary to one 32-bit hex word per line for `$readmemh` (see `firmware/` for the conversion script/notes).
 
 ---
 
 ## Dependencies
 
-- [Icarus Verilog](https://steveicarus.github.io/iverilog/) — for simulation
-- [GTKWave](http://gtkwave.sourceforge.net/) — for waveform viewing (optional)
-- [PicoRV32](https://github.com/YosysHQ/picorv32) — the open-source RISC-V core used as the CPU
+- [Icarus Verilog](https://steveicarus.github.io/iverilog/) — simulation
+- [Vivado](https://www.xilinx.com/support/download.html) — synthesis, implementation, alternate simulation
+- [GTKWave](http://gtkwave.sourceforge.net/) — waveform viewing (optional)
+- [PicoRV32](https://github.com/YosysHQ/picorv32) — open-source RISC-V core used as the CPU
+- `riscv64-linux-gnu-gcc`/`as`/`ld`/`objcopy` (or an RV32 bare-metal toolchain) — for building firmware
 
 ---
 
+## Next Steps
+
+- Add XDC timing/pin constraints for target board (Spartan-7 XC7S50CSGA324-1)
+- Run synthesis/implementation, confirm BRAM inference for `mem.v` and timing closure
+- Hardware bring-up and physical verification once board access is available
+- Fix accelerator's continuous-accumulation behavior with a proper single-shot compute mode
